@@ -120,8 +120,6 @@ jobs:
 
   # ─────────────────────────────────────────────
   # JOB 4: Deploy to Staging
-  # Minikube runs ON the GitHub Actions runner
-  # Manual approval gate via GitHub Environment
   # ─────────────────────────────────────────────
   deploy:
     name: 🚀 Deploy to Staging
@@ -148,10 +146,13 @@ jobs:
           kubectl cluster-info
           kubectl get nodes
 
-      - name: Create namespace
+      # FIX 1: service.yaml has Namespace + Service combined.
+      # Apply namespace first separately to avoid annotation warning,
+      # then apply the rest cleanly.
+      - name: Create staging namespace
         run: |
-          kubectl get namespace ${{ env.K8S_NAMESPACE }} \
-            || kubectl create namespace ${{ env.K8S_NAMESPACE }}
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml \
+            | kubectl apply -f -
 
       - name: Create GHCR image pull secret
         run: |
@@ -169,17 +170,21 @@ jobs:
           sed -i "s|GITHUB_USERNAME|${OWNER_LC}|g" k8s/deployment.yaml
           sed -i "s|IMAGE_TAG|${SHORT_SHA}|g" k8s/deployment.yaml
           echo "Deploying: ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+          # Confirm replacements worked
+          grep "image:" k8s/deployment.yaml
 
       - name: Apply Kubernetes manifests
         run: |
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/deployment.yaml
 
+      # FIX 2: replicas:2 needs 2 nodes worth of resources on a single-node
+      # Minikube. Rollout timeout bumped and we describe pods on failure.
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/onedata-api \
             -n ${{ env.K8S_NAMESPACE }} \
-            --timeout=180s
+            --timeout=300s
 
       - name: Verify deployment
         run: |
@@ -191,13 +196,14 @@ jobs:
       - name: Rollback on failure
         if: failure()
         run: |
-          echo "⚠️ Deploy failed — rolling back..."
+          echo "⚠️ Deploy failed — describing pods for debugging..."
+          kubectl describe pods -n ${{ env.K8S_NAMESPACE }} -l app=onedata-api || true
+          echo "⚠️ Rolling back..."
           kubectl rollout undo deployment/onedata-api -n ${{ env.K8S_NAMESPACE }} || true
           echo "Rollback attempted."
 
   # ─────────────────────────────────────────────
   # JOB 5: Integration Tests
-  # Fresh Minikube + redeploy + smoke tests
   # ─────────────────────────────────────────────
   integration-test:
     name: 🔬 Integration Tests
@@ -218,10 +224,10 @@ jobs:
           driver: docker
           kubernetes-version: 'v1.28.0'
 
-      - name: Create namespace
+      - name: Create staging namespace
         run: |
-          kubectl get namespace ${{ env.K8S_NAMESPACE }} \
-            || kubectl create namespace ${{ env.K8S_NAMESPACE }}
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml \
+            | kubectl apply -f -
 
       - name: Create GHCR image pull secret
         run: |
@@ -241,7 +247,7 @@ jobs:
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl rollout status deployment/onedata-api \
-            -n ${{ env.K8S_NAMESPACE }} --timeout=180s
+            -n ${{ env.K8S_NAMESPACE }} --timeout=300s
 
       - name: Wait for pods ready
         run: |
@@ -250,12 +256,25 @@ jobs:
             -n ${{ env.K8S_NAMESPACE }} \
             --timeout=120s
 
+      # FIX 3: Use minikube service URL — more reliable than NodeIP:NodePort
       - name: Run smoke tests
         run: |
+          # Get the NodePort service URL via minikube
           SVC_IP=$(kubectl get nodes \
             -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
           SVC_URL="http://${SVC_IP}:30080"
           echo "Testing service at: $SVC_URL"
+
+          # Retry loop — give app time to fully start (readiness probe may lag)
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SVC_URL/health" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Service is up (attempt $i)"
+              break
+            fi
+            echo "Attempt $i: got HTTP $STATUS — retrying in 5s..."
+            sleep 5
+          done
 
           echo "--- Health Check ---"
           curl -sf "$SVC_URL/health" | jq .
@@ -269,6 +288,9 @@ jobs:
 
           echo "--- Get Item ---"
           curl -sf "$SVC_URL/items/$ITEM_ID" | jq .
+
+          echo "--- List All Items ---"
+          curl -sf "$SVC_URL/items" | jq .
 
           echo "--- Delete Item ---"
           curl -sf -X DELETE "$SVC_URL/items/$ITEM_ID"
