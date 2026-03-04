@@ -6,14 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+# ─── FIX: Explicit permissions required for GHCR push ───────────────────────
+permissions:
+  contents: read
+  packages: write    # allows pushing to ghcr.io
+  id-token: write
+
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/onedata-devops-api
+  IMAGE_NAME: onedata-devops-api
   K8S_NAMESPACE: staging
 
 jobs:
   # ─────────────────────────────────────────────
-  # JOB 1: Checkout & Lint
+  # JOB 1: Lint
   # ─────────────────────────────────────────────
   lint:
     name: 🔍 Lint
@@ -51,7 +57,7 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install all dependencies (including devDeps)
+      - name: Install dependencies
         run: npm ci
 
       - name: Run unit tests with coverage
@@ -72,15 +78,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: unit-test
     outputs:
-      image_tag: ${{ steps.meta.outputs.tags }}
       short_sha: ${{ steps.vars.outputs.short_sha }}
+      full_image: ${{ steps.vars.outputs.full_image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set short SHA
+      - name: Set image vars (GHCR requires lowercase owner)
         id: vars
-        run: echo "short_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          FULL_IMAGE="ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "owner_lc=${OWNER_LC}" >> $GITHUB_OUTPUT
+          echo "Building: ${FULL_IMAGE}"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -88,15 +101,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=,format=short
-            type=ref,event=branch
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -106,28 +110,24 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.vars.outputs.full_image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Docker image summary
         run: |
           echo "## Docker Image Built 🐳" >> $GITHUB_STEP_SUMMARY
-          echo "**Registry:** ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag (commit SHA):** ${{ steps.vars.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ steps.vars.outputs.full_image }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit SHA tag:** ${{ steps.vars.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
 
   # ─────────────────────────────────────────────
-  # JOB 4: Deploy to Minikube (staging)
-  # Requires manual approval via GitHub Environment
+  # JOB 4: Deploy to Staging (manual approval gate)
   # ─────────────────────────────────────────────
   deploy:
     name: 🚀 Deploy to Staging
     runs-on: ubuntu-latest
     needs: docker-build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    # This environment has a manual approval gate configured in GitHub Settings
     environment:
       name: staging
       url: http://localhost:30080
@@ -142,33 +142,30 @@ jobs:
           version: 'v1.28.0'
 
       - name: Configure kubeconfig
-        # KUBE_CONFIG secret contains base64-encoded kubeconfig for Minikube/kind
         run: |
           mkdir -p ~/.kube
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
           kubectl cluster-info
 
-      - name: Create namespace if not exists
+      - name: Create staging namespace if not exists
         run: |
-          kubectl apply -f k8s/service.yaml --dry-run=client
           kubectl get namespace ${{ env.K8S_NAMESPACE }} \
             || kubectl create namespace ${{ env.K8S_NAMESPACE }}
 
-      - name: Update image tag in manifest
-        env:
-          SHORT_SHA: ${{ needs.docker-build.outputs.short_sha }}
-          GITHUB_USERNAME: ${{ github.repository_owner }}
+      - name: Update image in manifest
         run: |
-          sed -i "s|GITHUB_USERNAME|${GITHUB_USERNAME}|g" k8s/deployment.yaml
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA="${{ needs.docker-build.outputs.short_sha }}"
+          sed -i "s|GITHUB_USERNAME|${OWNER_LC}|g" k8s/deployment.yaml
           sed -i "s|IMAGE_TAG|${SHORT_SHA}|g" k8s/deployment.yaml
-          echo "Deploying image: ghcr.io/${GITHUB_USERNAME}/onedata-devops-api:${SHORT_SHA}"
+          echo "Deploying: ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
 
       - name: Apply Kubernetes manifests
         run: |
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/deployment.yaml
 
-      - name: Wait for rollout to complete
+      - name: Wait for rollout
         run: |
           kubectl rollout status deployment/onedata-api \
             -n ${{ env.K8S_NAMESPACE }} \
@@ -176,27 +173,19 @@ jobs:
 
       - name: Verify deployment
         run: |
-          echo "## Deployment Status ✅" >> $GITHUB_STEP_SUMMARY
-          kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
-            -l app=onedata-api \
-            -o wide | tee -a $GITHUB_STEP_SUMMARY
-          kubectl get services -n ${{ env.K8S_NAMESPACE }} \
-            | tee -a $GITHUB_STEP_SUMMARY
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=onedata-api -o wide
+          kubectl get services -n ${{ env.K8S_NAMESPACE }}
 
-      # Rollback on failure (bonus requirement)
       - name: Rollback on failure
         if: failure()
         run: |
           echo "⚠️ Deploy failed — rolling back..."
-          kubectl rollout undo deployment/onedata-api \
-            -n ${{ env.K8S_NAMESPACE }}
-          kubectl rollout status deployment/onedata-api \
-            -n ${{ env.K8S_NAMESPACE }} --timeout=60s
+          kubectl rollout undo deployment/onedata-api -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout status deployment/onedata-api -n ${{ env.K8S_NAMESPACE }} --timeout=60s
           echo "Rollback complete."
 
   # ─────────────────────────────────────────────
-  # JOB 5: Integration Tests (Bonus — parallel)
-  # Runs after deploy, tests live service
+  # JOB 5: Integration Tests
   # ─────────────────────────────────────────────
   integration-test:
     name: 🔬 Integration Tests
@@ -215,7 +204,7 @@ jobs:
           mkdir -p ~/.kube
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
 
-      - name: Wait for service to be ready
+      - name: Wait for pods to be ready
         run: |
           kubectl wait --for=condition=Ready pod \
             -l app=onedata-api \
@@ -224,14 +213,13 @@ jobs:
 
       - name: Run smoke tests via curl
         run: |
-          SVC_URL="http://$(minikube ip 2>/dev/null || echo 'localhost'):30080"
+          SVC_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+          SVC_URL="http://${SVC_IP}:30080"
           echo "Testing service at $SVC_URL"
 
-          # Health check
           echo "--- Health Check ---"
           curl -sf "$SVC_URL/health" | jq .
 
-          # Create item
           echo "--- Create Item ---"
           ITEM=$(curl -sf -X POST "$SVC_URL/items" \
             -H "Content-Type: application/json" \
@@ -239,11 +227,9 @@ jobs:
           echo "$ITEM" | jq .
           ITEM_ID=$(echo "$ITEM" | jq -r '.id')
 
-          # Get item
           echo "--- Get Item ---"
           curl -sf "$SVC_URL/items/$ITEM_ID" | jq .
 
-          # Delete item
           echo "--- Delete Item ---"
           curl -sf -X DELETE "$SVC_URL/items/$ITEM_ID"
 
