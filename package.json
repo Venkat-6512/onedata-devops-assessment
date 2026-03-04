@@ -1,0 +1,24 @@
+{
+  "name": "onedata-devops-api",
+  "version": "1.0.0",
+  "description": "Simple REST API for OneData DevOps Assessment - Task 1",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --coverage --forceExit",
+    "lint": "eslint src/ tests/"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": ["src/**/*.js"]
+  }
+}
