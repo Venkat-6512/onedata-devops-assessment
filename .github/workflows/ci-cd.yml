@@ -120,7 +120,7 @@ jobs:
 
   # ─────────────────────────────────────────────
   # JOB 4: Deploy to Staging
-  # Spins up Minikube ON the runner itself
+  # Minikube runs ON the GitHub Actions runner
   # Manual approval gate via GitHub Environment
   # ─────────────────────────────────────────────
   deploy:
@@ -136,29 +136,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Start Minikube directly on the runner ──
-      - name: Start Minikube
+      - name: Start Minikube on runner
         uses: medyagh/setup-minikube@latest
         with:
           minikube-version: 'latest'
           driver: docker
           kubernetes-version: 'v1.28.0'
 
-      - name: Verify Minikube is running
+      - name: Verify cluster is up
         run: |
           kubectl cluster-info
           kubectl get nodes
 
-      # ── Log in to GHCR so Minikube can pull the image ──
-      - name: Configure GHCR image pull secret
+      - name: Create namespace
         run: |
-          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-
-          # Create namespace first
           kubectl get namespace ${{ env.K8S_NAMESPACE }} \
             || kubectl create namespace ${{ env.K8S_NAMESPACE }}
 
-          # Create imagePullSecret so Minikube can pull from GHCR
+      - name: Create GHCR image pull secret
+        run: |
           kubectl create secret docker-registry ghcr-secret \
             --docker-server=ghcr.io \
             --docker-username=${{ github.actor }} \
@@ -166,20 +162,13 @@ jobs:
             --namespace=${{ env.K8S_NAMESPACE }} \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      # ── Patch deployment manifest with real image + pull secret ──
-      - name: Update manifest with image and pull secret
+      - name: Update image tag in manifest
         run: |
           OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SHORT_SHA="${{ needs.docker-build.outputs.short_sha }}"
-
           sed -i "s|GITHUB_USERNAME|${OWNER_LC}|g" k8s/deployment.yaml
           sed -i "s|IMAGE_TAG|${SHORT_SHA}|g" k8s/deployment.yaml
-
-          # Inject imagePullSecrets into the deployment
-          sed -i '/restartPolicy: Always/i\      imagePullSecrets:\n        - name: ghcr-secret' k8s/deployment.yaml
-
           echo "Deploying: ghcr.io/${OWNER_LC}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
-          cat k8s/deployment.yaml
 
       - name: Apply Kubernetes manifests
         run: |
@@ -194,10 +183,10 @@ jobs:
 
       - name: Verify deployment
         run: |
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=onedata-api -o wide
+          kubectl get services -n ${{ env.K8S_NAMESPACE }}
           echo "## ✅ Deployment Status" >> $GITHUB_STEP_SUMMARY
-          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=onedata-api -o wide | tee -a $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          kubectl get services -n ${{ env.K8S_NAMESPACE }} | tee -a $GITHUB_STEP_SUMMARY
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=onedata-api -o wide >> $GITHUB_STEP_SUMMARY
 
       - name: Rollback on failure
         if: failure()
@@ -208,11 +197,12 @@ jobs:
 
   # ─────────────────────────────────────────────
   # JOB 5: Integration Tests
+  # Fresh Minikube + redeploy + smoke tests
   # ─────────────────────────────────────────────
   integration-test:
     name: 🔬 Integration Tests
     runs-on: ubuntu-latest
-    needs: deploy
+    needs: [docker-build, deploy]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
       name: staging
@@ -221,19 +211,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Spin up fresh Minikube again for integration tests
-      - name: Start Minikube
+      - name: Start Minikube on runner
         uses: medyagh/setup-minikube@latest
         with:
           minikube-version: 'latest'
           driver: docker
           kubernetes-version: 'v1.28.0'
 
-      - name: Configure GHCR pull secret
+      - name: Create namespace
         run: |
           kubectl get namespace ${{ env.K8S_NAMESPACE }} \
             || kubectl create namespace ${{ env.K8S_NAMESPACE }}
 
+      - name: Create GHCR image pull secret
+        run: |
           kubectl create secret docker-registry ghcr-secret \
             --docker-server=ghcr.io \
             --docker-username=${{ github.actor }} \
@@ -241,13 +232,12 @@ jobs:
             --namespace=${{ env.K8S_NAMESPACE }} \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Re-deploy for integration tests
+      - name: Deploy application
         run: |
           OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SHORT_SHA="${{ needs.docker-build.outputs.short_sha }}"
           sed -i "s|GITHUB_USERNAME|${OWNER_LC}|g" k8s/deployment.yaml
           sed -i "s|IMAGE_TAG|${SHORT_SHA}|g" k8s/deployment.yaml
-          sed -i '/restartPolicy: Always/i\      imagePullSecrets:\n        - name: ghcr-secret' k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl rollout status deployment/onedata-api \
@@ -260,12 +250,12 @@ jobs:
             -n ${{ env.K8S_NAMESPACE }} \
             --timeout=120s
 
-      - name: Run smoke tests via curl
+      - name: Run smoke tests
         run: |
           SVC_IP=$(kubectl get nodes \
             -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
           SVC_URL="http://${SVC_IP}:30080"
-          echo "Testing service at $SVC_URL"
+          echo "Testing service at: $SVC_URL"
 
           echo "--- Health Check ---"
           curl -sf "$SVC_URL/health" | jq .

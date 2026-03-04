@@ -21,9 +21,10 @@ spec:
       labels:
         app: onedata-api
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
         - name: onedata-api
-          # IMAGE_TAG is replaced by CI pipeline with actual commit SHA
           image: ghcr.io/GITHUB_USERNAME/onedata-devops-api:IMAGE_TAG
           ports:
             - containerPort: 3000
